@@ -1,0 +1,23 @@
+use crate::list::ListState;
+
+#[derive(Debug)]
+pub enum Value {
+    String(Vec<u8>),
+    List(ListState),
+}
+
+impl Value {
+    pub fn as_string(&self) -> Option<&[u8]> {
+        match self {
+            Value::String(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn as_list_mut(&mut self) -> Option<&mut ListState> {
+        match self {
+            Value::List(ref mut l) => Some(l),
+            _ => None,
+        }
+    }
+}
