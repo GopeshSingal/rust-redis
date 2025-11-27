@@ -9,6 +9,9 @@ pub enum Command {
     LPush(String, Vec<Vec<u8>>),
     RPop(String),
     BRPop(String, usize),
+    Del(String),
+    Expire(String, usize),
+    Ttl(String),
 }
 
 impl TryFrom<Frame> for Command {
@@ -75,6 +78,30 @@ impl TryFrom<Frame> for Command {
                     RedisError::Other("ERR timeout must be integer".into())
                 })?;
                 Ok(Command::BRPop(key, timeout))
+            }
+            "DEL" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("Err wrong number of arguments for 'DEL'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::Del(key))
+            }
+            "EXPIRE" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("Err wrong number of arguments for 'EXPIRE'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let secs: usize = frame_to_string(&arr[2])?
+                    .parse::<usize>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                Ok(Command::Expire(key, secs))
+            }
+            "TTL" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'TTL'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::Ttl(key))
             }
             _ => Err(RedisError::UnknownCommand),
         }

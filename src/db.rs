@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Instant, Duration};
 
 use tokio::sync::RwLock;
 use tokio::time;
@@ -14,13 +14,31 @@ use crate::errors::RedisError;
 #[derive(Debug)]
 pub struct Db {
     inner: RwLock<HashMap<String, Value>>,
+    ttl: RwLock<HashMap<String, Instant>>,
 }
 
 impl Db {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            ttl: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub async fn get_inner(&self) -> tokio::sync::RwLockReadGuard<'_, HashMap<String, Value>> {
+        self.inner.read().await
+    }
+
+    pub async fn get_inner_mut(&self) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, Value>> {
+        self.inner.write().await
+    }
+
+    pub async fn get_ttl(&self) -> tokio::sync::RwLockReadGuard<'_, HashMap<String, Instant>> {
+        self.ttl.read().await
+    }
+
+    pub async fn get_ttl_mut(&self) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, Instant>> {
+        self.ttl.write().await
     }
 
     pub async fn apply(&self, cmd: Command) -> Frame {
@@ -31,6 +49,9 @@ impl Db {
             Command::LPush(key, vals) => self.lpush(key, vals).await,
             Command::RPop(key) => self.rpop(&key).await,
             Command::BRPop(key, timeout) => self.brpop(key, timeout).await,
+            Command::Del(key) => self.del(&key).await,
+            Command::Expire(key, secs) => self.expire(key, secs).await,
+            Command::Ttl(key) => self.ttl(&key).await,
         }
     }
 
@@ -123,6 +144,52 @@ impl Db {
             if notified.is_err() {
                 return Frame::Null;
             }
+        }
+    }
+
+    async fn del(&self, key: &str) -> Frame {
+        let mut inner = self.inner.write().await;
+        let removed = inner.remove(key).is_some();
+
+        let mut ttl = self.ttl.write().await;
+        ttl.remove(key);
+
+        Frame::Integer(removed as i64)
+    }
+
+    async fn expire(&self, key: String, secs: usize) -> Frame {
+        let inner = self.inner.read().await;
+        if !inner.contains_key(&key) {
+            return Frame::Integer(0);
+        }
+
+        drop(inner);
+
+        let mut ttl = self.ttl.write().await;
+        ttl.insert(key, Instant::now() + Duration::from_secs(secs as u64));
+        Frame::Integer(1)
+    }
+
+    async fn ttl(&self, key: &str) -> Frame {
+        let inner = self.inner.read().await;
+        if !inner.contains_key(key) {
+            return Frame::Integer(-2);
+        }
+
+        drop(inner);
+
+        let ttl = self.ttl.read().await;
+        if let Some(exp_at) = ttl.get(key) {
+            let now = Instant::now();
+
+            if now >= *exp_at {
+                return Frame::Integer(-2);
+            }
+
+            let remaining = (*exp_at - now).as_secs() as i64;
+            Frame::Integer(remaining)
+        } else {
+            Frame::Integer(-1)
         }
     }
 }
