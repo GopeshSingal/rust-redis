@@ -5,12 +5,24 @@ use crate::resp::{Frame, parse_frame, encode_frame};
 
 pub struct Connection {
     reader: BufReader<TcpStream>,
+    writer: TcpStream,
 }
 
 impl Connection {
     pub fn new(stream: TcpStream) -> Self {
         Self {
             reader: BufReader::new(stream),
+        }
+    }
+
+    pub fn new_from_reader<R>(reader: R) -> Self 
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        let rd = BufReader::new(reader);
+        Self {
+            reader: rd,
+            writer: None,
         }
     }
 

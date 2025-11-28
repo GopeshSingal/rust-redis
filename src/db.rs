@@ -4,18 +4,23 @@ use std::time::{Instant, Duration};
 
 use tokio::sync::RwLock;
 use tokio::time;
+use tokio::fs::File;
+use tokio::io::BufReader;
 
 use crate::command::Command;
-use crate::resp::Frame;
+use crate::connection::Connection;
+use crate::resp::{Frame, encode_frame};
 use crate::value::Value;
 use crate::list::ListState;
 use crate::skiplist::SkipList;
 use crate::errors::RedisError;
+use crate::aof::Aof;
 
 #[derive(Debug)]
 pub struct Db {
     inner: RwLock<HashMap<String, Value>>,
     ttl: RwLock<HashMap<String, Instant>>,
+    aof: Option<Arc<Aof>>,
 }
 
 impl Db {
@@ -23,6 +28,17 @@ impl Db {
         Self {
             inner: RwLock::new(HashMap::new()),
             ttl: RwLock::new(HashMap::new()),
+            aof: None,
+        }
+    }
+
+    pub fn new_with_aof(aof_path: Option<&str>) -> Self {
+        let aof = aof_path.map(|p| Arc::new(Aof::new(p).unwrap()));
+
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            ttl: RwLock::new(HashMap::new()),
+            aof,
         }
     }
 
@@ -40,6 +56,27 @@ impl Db {
 
     pub async fn get_ttl_mut(&self) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, Instant>> {
         self.ttl.write().await
+    }
+
+    fn aof_write(&self, frame: &Frame) {
+        if let Some(aof) = &self.aof {
+            let encoded = encode_frame(frame);
+            aof.append(&encoded);
+        }
+    }
+
+    pub async fn load_aof(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::open(path).await?;
+        let reader = BufReader::new(file);
+
+        let mut conn = Connection::new_from_reader(reader);
+
+        while let Ok(Some(frame)) = conn.read_frame().await {
+            let cmd = Command::try_from(frame)?;
+            self.apply(cmd).await;
+        }
+
+        Ok(())
     }
 
     pub async fn apply(&self, cmd: Command) -> Frame {
@@ -69,21 +106,43 @@ impl Db {
     }
 
     async fn set(&self, key: String, val: Vec<u8>) -> Frame {
-        let mut inner = self.inner.write().await;
-        inner.insert(key, Value::String(val));
+        {
+            let mut inner = self.inner.write().await;
+            inner.insert(key.clone(), Value::String(val.clone()));
+        }
+
+        let frame = Frame::Array(vec![
+            Frame::Bulk(b"SET".to_vec()),
+            Frame::Bulk(key.clone().into_bytes()),
+            Frame::Bulk(val.clone()),
+        ]);
+        self.aof_write(&frame);
+
         Frame::Simple("OK".into())
     }
 
     async fn lpush(&self, key: String, vals: Vec<Vec<u8>>) -> Frame {
         let mut inner = self.inner.write().await;
-        let entry = inner.entry(key).or_insert_with(|| Value::List(ListState::new()));
+        let entry = inner.entry(key.clone())
+            .or_insert_with(|| Value::List(ListState::new()));
 
         match entry {
             Value::List(list) => {
-                for v in vals {
-                    list.data.push_front(v);
+                for v in &vals {
+                    list.data.push_front(v.clone());
                 }
                 list.notify.notify_one();
+
+                let mut elements = vec![
+                    Frame::Bulk(b"LPUSH".to_vec()),
+                    Frame::Bulk(key.clone().into_bytes()),
+                ];
+                for v in vals.clone() {
+                    elements.push(Frame::Bulk(v));
+                }
+                let frame = Frame::Array(elements);
+                self.aof_write(&frame);
+
                 Frame::Integer(list.data.len() as i64)
             }
             _ => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
@@ -92,19 +151,25 @@ impl Db {
 
     async fn rpop(&self, key: &str) -> Frame {
         let mut inner = self.inner.write().await;
-        let value_opt = inner.get_mut(key);
-        if let Some(value) = value_opt {
-            if let Some(list) = value.as_list_mut() {
-                if let Some(v) = list.data.pop_back() {
-                    return Frame::Bulk(v);
-                } else {
-                    return Frame::Null;
-                }
-            } else {
-                return Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into());
+
+        let Some(value) = inner.get_mut(key) else {
+            return Frame::Null;
+        };
+
+        if let Value::List(list) = value {
+            if let Some(v) = list.data.pop_back() {
+                let frame = Frame::Array(vec![
+                    Frame::Bulk(b"RPOP".to_vec()),
+                    Frame::Bulk(key.as_bytes().to_vec()),
+                ]);
+                self.aof_write(&frame);
+
+                return Frame::Bulk(v);
             }
+            Frame::Null
+        } else {
+            Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
         }
-        Frame::Null
     }
 
     async fn brpop(&self, key: String, timeout_secs: usize) -> Frame {
@@ -114,13 +179,18 @@ impl Db {
         loop {
             let notify = {
                 let mut inner = self.inner.write().await;
-                let entry = inner
-                    .entry(key.clone())
+                let entry = inner.entry(key.clone())
                     .or_insert_with(|| Value::List(ListState::new()));
 
                 match entry {
                     Value::List(list) => {
                         if let Some(v) = list.data.pop_back() {
+                            let frame = Frame::Array(vec![
+                                Frame::Bulk(b"RPOP".to_vec()),
+                                Frame::Bulk(key.clone().into_bytes()),
+                            ]);
+                            self.aof_write(&frame);
+
                             return Frame::Array(vec![
                                 Frame::Bulk(key.as_bytes().to_vec()),
                                 Frame::Bulk(v),
@@ -130,8 +200,7 @@ impl Db {
                     }
                     _ => {
                         return Frame::Error(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value"
-                                .into(),
+                            "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
                         );
                     }
                 }
@@ -157,6 +226,13 @@ impl Db {
 
         let mut ttl = self.ttl.write().await;
         ttl.remove(key);
+        
+        let frame = Frame::Array(vec![
+            Frame::Bulk(b"DEL".to_vec()),
+            Frame::Bulk(key.as_bytes().to_vec()),
+        ]);
+        
+        self.aof_write(&frame);
 
         Frame::Integer(removed as i64)
     }
@@ -171,6 +247,12 @@ impl Db {
 
         let mut ttl = self.ttl.write().await;
         ttl.insert(key, Instant::now() + Duration::from_secs(secs as u64));
+        let frame = Frame::Array(vec![
+            Frame::Bulk(b"EXPIRE".to_vec()),
+            Frame::Bulk(key.clone().into_bytes()),
+            Frame::Bulk(secs.to_string().into_bytes()),
+        ]);
+        self.aof_write(&frame);
         Frame::Integer(1)
     }
 
@@ -198,19 +280,27 @@ impl Db {
     }
 
     async fn zadd(&self, key: String, score: f64, member: Vec<u8>) -> Frame {
-        let mut inner = self.get_inner_mut().await;
+        let key_clone = key.clone();
+
+        let mut inner = self.inner.write().await;
         let entry = inner
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| Value::ZSet(SkipList::new()));
 
         match entry {
             Value::ZSet(zset) => {
-                zset.insert(score, member);
+                zset.insert(score, member.clone());
+                let frame = Frame::Array(vec![
+                    Frame::Bulk(b"ZADD".to_vec()),
+                    Frame::Bulk(key_clone.into_bytes()),
+                    Frame::Bulk(score.to_string().into_bytes()),
+                    Frame::Bulk(member.clone()),
+                ]);
+                self.aof_write(&frame);
+
                 Frame::Integer(1)
             }
-            _ => Frame::Error(
-                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
-            ),
+            _ => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
         }
     }
 
@@ -236,7 +326,9 @@ impl Db {
     }
 
     async fn zrem(&self, key: String, member: Vec<u8>) -> Frame {
-        let mut inner = self.get_inner_mut().await;
+        let key_clone = key.clone();
+
+        let mut inner = self.inner.write().await;
         let Some(value) = inner.get_mut(&key) else {
             return Frame::Integer(0);
         };
@@ -244,6 +336,16 @@ impl Db {
         match value {
             Value::ZSet(zset) => {
                 let removed = zset.remove_member(&member);
+
+                if removed {
+                    let frame = Frame::Array(vec![
+                        Frame::Bulk(b"ZREM".to_vec()),
+                        Frame::Bulk(key_clone.into_bytes()),
+                        Frame::Bulk(member.clone()),
+                    ]);
+                    self.aof_write(&frame);
+                }
+
                 Frame::Integer(if removed { 1 } else { 0 })
             }
             _ => Frame::Error(
