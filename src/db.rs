@@ -42,6 +42,33 @@ impl Db {
         self.ttl.write().await
     }
 
+    async fn is_expired(&self, key: &str) -> bool {
+        let ttl = self.ttl.read().await;
+        if let Some(exp_at) = ttl.get(key) {
+            if Instant::now() >= *exp_at {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn purge_expired(&self, key: &str) {
+        let mut ttl = self.ttl.write().await;
+        let mut inner = self.inner.write().await;
+
+        ttl.remove(key);
+        inner.remove(key);
+    }
+
+    async fn check_and_purge(&self, key: &str) -> bool {
+        if self.is_expired(key).await {
+            self.purge_expired(key).await;
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn apply(&self, cmd: Command) -> Frame {
         match cmd {
             Command::Ping => Frame::Simple("PONG".to_string()),
@@ -60,6 +87,9 @@ impl Db {
     }
 
     async fn get(&self, key: &str) -> Frame {
+        if self.check_and_purge(key).await {
+            return Frame::Null;
+        }
         let inner = self.inner.read().await;
         match inner.get(key) {
             Some(Value::String(v)) => Frame::Bulk(v.clone()),
@@ -69,12 +99,14 @@ impl Db {
     }
 
     async fn set(&self, key: String, val: Vec<u8>) -> Frame {
+        self.check_and_purge(&key).await;
         let mut inner = self.inner.write().await;
         inner.insert(key, Value::String(val));
         Frame::Simple("OK".into())
     }
 
     async fn lpush(&self, key: String, vals: Vec<Vec<u8>>) -> Frame {
+        self.check_and_purge(&key).await;
         let mut inner = self.inner.write().await;
         let entry = inner.entry(key).or_insert_with(|| Value::List(ListState::new()));
 
@@ -91,6 +123,9 @@ impl Db {
     }
 
     async fn rpop(&self, key: &str) -> Frame {
+        if self.check_and_purge(key).await {
+            return Frame::Null;
+        }
         let mut inner = self.inner.write().await;
         let value_opt = inner.get_mut(key);
         if let Some(value) = value_opt {
@@ -108,34 +143,57 @@ impl Db {
     }
 
     async fn brpop(&self, key: String, timeout_secs: usize) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Null;
+        }
+
         let timeout = Duration::from_secs(timeout_secs as u64);
         let deadline = time::Instant::now() + timeout;
 
         loop {
-            let notify = {
+            let notify_opt = {
                 let mut inner = self.inner.write().await;
-                let entry = inner
-                    .entry(key.clone())
-                    .or_insert_with(|| Value::List(ListState::new()));
 
-                match entry {
-                    Value::List(list) => {
+                match inner.get_mut(&key) {
+                    Some(Value::List(list)) => {
                         if let Some(v) = list.data.pop_back() {
                             return Frame::Array(vec![
                                 Frame::Bulk(key.as_bytes().to_vec()),
                                 Frame::Bulk(v),
                             ]);
                         }
-                        list.notify.clone()
+                        Some(list.notify.clone())
                     }
-                    _ => {
+                    Some(_) => {
                         return Frame::Error(
                             "WRONGTYPE Operation against a key holding the wrong kind of value"
                                 .into(),
                         );
                     }
+                    None => {
+                        None
+                    }
                 }
             };
+
+            if let Some(notify) = notify_opt {
+                let now = time::Instant::now();
+                if now >= deadline {
+                    return Frame::Null;
+                }
+
+                let remaining = deadline - now;
+
+                if time::timeout(remaining, notify.notified()).await.is_err() {
+                    return Frame::Null;
+                }
+
+                if self.check_and_purge(&key).await {
+                    return Frame::Null;
+                }
+
+                continue;
+            }
 
             let now = time::Instant::now();
             if now >= deadline {
@@ -143,15 +201,21 @@ impl Db {
             }
 
             let remaining = deadline - now;
+            let sleep_dur = remaining.min(Duration::from_millis(10));
+            time::sleep(sleep_dur).await;
 
-            let notified = time::timeout(remaining, notify.notified()).await;
-            if notified.is_err() {
+            if self.check_and_purge(&key).await {
                 return Frame::Null;
             }
         }
     }
 
+
     async fn del(&self, key: &str) -> Frame {
+        if self.check_and_purge(key).await {
+            return Frame::Integer(0);
+        }
+        
         let mut inner = self.inner.write().await;
         let removed = inner.remove(key).is_some();
 
@@ -198,6 +262,7 @@ impl Db {
     }
 
     async fn zadd(&self, key: String, score: f64, member: Vec<u8>) -> Frame {
+        self.check_and_purge(&key).await;
         let mut inner = self.get_inner_mut().await;
         let entry = inner
             .entry(key)
@@ -215,6 +280,7 @@ impl Db {
     }
 
     async fn zrange_by_score(&self, key: String, min: f64, max: f64) -> Frame {
+        self.check_and_purge(&key).await;
         let inner = self.get_inner().await;
         let Some(value) = inner.get(&key) else {
             return Frame::Array(vec![]);
@@ -236,6 +302,7 @@ impl Db {
     }
 
     async fn zrem(&self, key: String, member: Vec<u8>) -> Frame {
+        self.check_and_purge(&key).await;
         let mut inner = self.get_inner_mut().await;
         let Some(value) = inner.get_mut(&key) else {
             return Frame::Integer(0);

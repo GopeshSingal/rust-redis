@@ -73,7 +73,7 @@ impl TryFrom<Frame> for Command {
             }
             "BRPOP" => {
                 if arr.len() != 3 {
-                    return Err(RedisError::Other("Err wrong number of arguments for 'BRPOP'".into()));
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'BRPOP'".into()));
                 }
                 let key = frame_to_string(&arr[1])?;
                 let timeout_str = frame_to_string(&arr[2])?;
@@ -84,14 +84,14 @@ impl TryFrom<Frame> for Command {
             }
             "DEL" => {
                 if arr.len() != 2 {
-                    return Err(RedisError::Other("Err wrong number of arguments for 'DEL'".into()));
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'DEL'".into()));
                 }
                 let key = frame_to_string(&arr[1])?;
                 Ok(Command::Del(key))
             }
             "EXPIRE" => {
                 if arr.len() != 3 {
-                    return Err(RedisError::Other("Err wrong number of arguments for 'EXPIRE'".into()));
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'EXPIRE'".into()));
                 }
                 let key = frame_to_string(&arr[1])?;
                 let secs: usize = frame_to_string(&arr[2])?

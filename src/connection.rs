@@ -1,5 +1,5 @@
 use tokio::net::TcpStream;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::resp::{Frame, parse_frame, encode_frame};
 
