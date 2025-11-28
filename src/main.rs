@@ -7,6 +7,7 @@ mod db;
 mod value;
 mod list;
 mod expiration;
+mod skiplist;
 
 use std::sync::Arc;
 use db::Db;

@@ -12,6 +12,9 @@ pub enum Command {
     Del(String),
     Expire(String, usize),
     Ttl(String),
+    ZAdd(String, f64, Vec<u8>),
+    ZRangeByScore(String, f64, f64),
+    ZRem(String, Vec<u8>),
 }
 
 impl TryFrom<Frame> for Command {
@@ -102,6 +105,40 @@ impl TryFrom<Frame> for Command {
                 }
                 let key = frame_to_string(&arr[1])?;
                 Ok(Command::Ttl(key))
+            }
+            "ZADD" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZADD'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let score: f64 = frame_to_string(&arr[2])?
+                    .parse()
+                    .map_err(|_| RedisError::Other("ERR score must be a float".into()))?;
+                let member = frame_to_bytes(&arr[3])?;
+                Ok(Command::ZAdd(key, score, member))
+            }
+            "ZRANGEBYSCORE" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other(
+                        "ERR wrong number of arguments for 'ZRANGEBYSCORE'".into(),
+                    ));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let min: f64 = frame_to_string(&arr[2])?
+                    .parse()
+                    .map_err(|_| RedisError::Other("ERR min must be a float".into()))?;
+                let max: f64 = frame_to_string(&arr[3])?
+                    .parse()
+                    .map_err(|_| RedisError::Other("ERR max must be a float".into()))?;
+                Ok(Command::ZRangeByScore(key, min, max))
+            }
+            "ZREM" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZREM'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let member = frame_to_bytes(&arr[2])?;
+                Ok(Command::ZRem(key, member))
             }
             _ => Err(RedisError::UnknownCommand),
         }

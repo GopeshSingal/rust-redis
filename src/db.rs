@@ -9,6 +9,7 @@ use crate::command::Command;
 use crate::resp::Frame;
 use crate::value::Value;
 use crate::list::ListState;
+use crate::skiplist::SkipList;
 use crate::errors::RedisError;
 
 #[derive(Debug)]
@@ -52,6 +53,9 @@ impl Db {
             Command::Del(key) => self.del(&key).await,
             Command::Expire(key, secs) => self.expire(key, secs).await,
             Command::Ttl(key) => self.ttl(&key).await,
+            Command::ZAdd(key, score, member) => self.zadd(key, score, member).await,
+            Command::ZRangeByScore(key, min, max) => self.zrange_by_score(key, min, max).await,
+            Command::ZRem(key, member) => self.zrem(key, member).await,
         }
     }
 
@@ -59,7 +63,7 @@ impl Db {
         let inner = self.inner.read().await;
         match inner.get(key) {
             Some(Value::String(v)) => Frame::Bulk(v.clone()),
-            Some(Value::List(_)) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
             None => Frame::Null,
         }
     }
@@ -190,6 +194,61 @@ impl Db {
             Frame::Integer(remaining)
         } else {
             Frame::Integer(-1)
+        }
+    }
+
+    async fn zadd(&self, key: String, score: f64, member: Vec<u8>) -> Frame {
+        let mut inner = self.get_inner_mut().await;
+        let entry = inner
+            .entry(key)
+            .or_insert_with(|| Value::ZSet(SkipList::new()));
+
+        match entry {
+            Value::ZSet(zset) => {
+                zset.insert(score, member);
+                Frame::Integer(1)
+            }
+            _ => Frame::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            ),
+        }
+    }
+
+    async fn zrange_by_score(&self, key: String, min: f64, max: f64) -> Frame {
+        let inner = self.get_inner().await;
+        let Some(value) = inner.get(&key) else {
+            return Frame::Array(vec![]);
+        };
+
+        match value {
+            Value::ZSet(zset) => {
+                let members = zset.range_by_score(min, max);
+                let frames = members
+                    .into_iter()
+                    .map(Frame::Bulk)
+                    .collect::<Vec<_>>();
+                Frame::Array(frames)
+            }
+            _ => Frame::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            ),
+        }
+    }
+
+    async fn zrem(&self, key: String, member: Vec<u8>) -> Frame {
+        let mut inner = self.get_inner_mut().await;
+        let Some(value) = inner.get_mut(&key) else {
+            return Frame::Integer(0);
+        };
+
+        match value {
+            Value::ZSet(zset) => {
+                let removed = zset.remove_member(&member);
+                Frame::Integer(if removed { 1 } else { 0 })
+            }
+            _ => Frame::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            ),
         }
     }
 }
