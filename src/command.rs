@@ -15,6 +15,17 @@ pub enum Command {
     ZAdd(String, f64, Vec<u8>),
     ZRangeByScore(String, f64, f64),
     ZRem(String, Vec<u8>),
+
+    // Hash commands
+    HSet(String, String, Vec<u8>),
+    HGet(String, String),
+    HDel(String, Vec<String>),
+    HGetAll(String),
+    HMGet(String, Vec<String>),
+    HExists(String, String),
+    HLen(String),
+    HKeys(String),
+    HVals(String),
 }
 
 impl TryFrom<Frame> for Command {
@@ -139,6 +150,82 @@ impl TryFrom<Frame> for Command {
                 let key = frame_to_string(&arr[1])?;
                 let member = frame_to_bytes(&arr[2])?;
                 Ok(Command::ZRem(key, member))
+            }
+            // Hash commands
+            "HSET" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HSET'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let field = frame_to_string(&arr[2])?;
+                let value = frame_to_bytes(&arr[3])?;
+                Ok(Command::HSet(key, field, value))
+            }
+            "HGET" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HGET'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let field = frame_to_string(&arr[2])?;
+                Ok(Command::HGet(key, field))
+            }
+            "HDEL" => {
+                if arr.len() < 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HDEL'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let mut fields = Vec::new();
+                for f in &arr[2..] {
+                    fields.push(frame_to_string(f)?);
+                }
+                Ok(Command::HDel(key, fields))
+            }
+            "HGETALL" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HGETALL'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::HGetAll(key))
+            }
+            "HMGET" => {
+                if arr.len() < 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HMGET'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let mut fields = Vec::new();
+                for f in &arr[2..] {
+                    fields.push(frame_to_string(f)?);
+                }
+                Ok(Command::HMGet(key, fields))
+            }
+            "HEXISTS" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HEXISTS'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let field = frame_to_string(&arr[2])?;
+                Ok(Command::HExists(key, field))
+            }
+            "HLEN" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HLEN'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::HLen(key))
+            }
+            "HKEYS" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HKEYS'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::HKeys(key))
+            }
+            "HVALS" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'HVALS'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::HVals(key))
             }
             _ => Err(RedisError::UnknownCommand),
         }
