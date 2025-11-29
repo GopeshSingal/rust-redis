@@ -26,6 +26,16 @@ pub enum Command {
     HLen(String),
     HKeys(String),
     HVals(String),
+
+    // Set commands
+    SAdd(String, Vec<Vec<u8>>),
+    SRem(String, Vec<Vec<u8>>),
+    SMembers(String),
+    SIsMember(String, Vec<u8>),
+    SCard(String),
+    SUnion(Vec<String>),
+    SInter(Vec<String>),
+    SDiff(Vec<String>),
 }
 
 impl TryFrom<Frame> for Command {
@@ -151,6 +161,7 @@ impl TryFrom<Frame> for Command {
                 let member = frame_to_bytes(&arr[2])?;
                 Ok(Command::ZRem(key, member))
             }
+
             // Hash commands
             "HSET" => {
                 if arr.len() != 4 {
@@ -226,6 +237,75 @@ impl TryFrom<Frame> for Command {
                 }
                 let key = frame_to_string(&arr[1])?;
                 Ok(Command::HVals(key))
+            }
+
+            // Set commands
+            "SADD" => {
+                if arr.len() < 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'SADD'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let mut members = Vec::new();
+                for f in &arr[2..] {
+                    members.push(frame_to_bytes(f)?);
+                }
+                Ok(Command::SAdd(key, members))
+            }
+            "SREM" => {
+                if arr.len() < 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'SREM'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let mut members = Vec::new();
+                for f in &arr[2..] {
+                    members.push(frame_to_bytes(f)?);
+                }
+                Ok(Command::SRem(key, members))
+            }
+            "SMEMBERS" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'SMEMBERS'".into()));
+                }
+                Ok(Command::SMembers(frame_to_string(&arr[1])?))
+            }
+            "SISMEMBER" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'SISMEMBER'".into()));
+                }
+                Ok(Command::SIsMember(frame_to_string(&arr[1])?, frame_to_bytes(&arr[2])?))
+            }
+            "SCARD" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'SCARD'".into()));
+                }
+                Ok(Command::SCard(frame_to_string(&arr[1])?))
+            }
+            "SUNION" => {
+                if arr.len() < 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'SUNION'".into()));
+                }
+                let keys = arr[1..].iter()
+                    .map(|f| frame_to_string(f))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Command::SUnion(keys))
+            }
+            "SINTER" => {
+                if arr.len() < 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'SINTER'".into()));
+                }
+                let keys = arr[1..].iter()
+                    .map(|f| frame_to_string(f))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Command::SInter(keys))
+            }
+            "SDIFF" => {
+                if arr.len() < 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'SDIFF'".into()));
+                }
+                let keys = arr[1..].iter()
+                    .map(|f| frame_to_string(f))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Command::SDiff(keys))
             }
             _ => Err(RedisError::UnknownCommand),
         }
