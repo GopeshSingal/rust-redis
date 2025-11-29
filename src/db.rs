@@ -83,6 +83,15 @@ impl Db {
             Command::ZAdd(key, score, member) => self.zadd(key, score, member).await,
             Command::ZRangeByScore(key, min, max) => self.zrange_by_score(key, min, max).await,
             Command::ZRem(key, member) => self.zrem(key, member).await,
+            Command::HSet(key, field, value) => self.hset(key, field, value).await,
+            Command::HGet(key, field) => self.hget(key, field).await,
+            Command::HDel(key, fields) => self.hdel(key, fields).await,
+            Command::HGetAll(key) => self.hgetall(key).await,
+            Command::HMGet(key, fields) => self.hmget(key, fields).await,
+            Command::HExists(key, field) => self.hexists(key, field).await,
+            Command::HLen(key) => self.hlen(key).await,
+            Command::HKeys(key) => self.hkeys(key).await,
+            Command::HVals(key) => self.hvals(key).await,
         }
     }
 
@@ -316,6 +325,177 @@ impl Db {
             _ => Frame::Error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
             ),
+        }
+    }
+
+    // Hash commands
+    async fn hset(&self, key: String, field: String, value: Vec<u8>) -> Frame {
+        self.check_and_purge(&key).await;
+
+        let mut inner = self.inner.write().await;
+
+        let entry = inner.entry(key).or_insert_with(|| {
+            Value::Hash(HashMap::new())
+        });
+
+        match entry {
+            Value::Hash(map) => {
+                let existed = map.insert(field, value).is_some();
+                Frame::Integer(if existed { 0 } else { 1 })
+            }
+            _ => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
+        }
+    }
+
+    async fn hget(&self, key: String, field: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Null;
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                match map.get(&field) {
+                    Some(val) => Frame::Bulk(val.clone()),
+                    None => Frame::Null,
+                }
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Null,
+        }
+    }
+
+    async fn hdel(&self, key: String, fields: Vec<String>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let mut inner = self.inner.write().await;
+
+        match inner.get_mut(&key) {
+            Some(Value::Hash(map)) => {
+                let mut removed = 0;
+                for f in fields {
+                    if map.remove(&f).is_some() {
+                        removed += 1;
+                    }
+                }
+                Frame::Integer(removed)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn hgetall(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                let mut arr = Vec::new();
+                for (k, v) in map {
+                    arr.push(Frame::Bulk(k.as_bytes().to_vec()));
+                    arr.push(Frame::Bulk(v.clone()));
+                }
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
+
+    async fn hmget(&self, key: String, fields: Vec<String>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![Frame::Null; fields.len()])
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                let mut arr = Vec::new();
+                for f in fields {
+                    match map.get(&f) {
+                        Some(v) => arr.push(Frame::Bulk(v.clone())),
+                        None => arr.push(Frame::Null),
+                    }
+                }
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![Frame::Null; fields.len()]),
+        }
+    }
+
+    async fn hexists(&self, key: String, field: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) =>
+                Frame::Integer(if map.contains_key(&field) { 1 } else { 0 }),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn hlen(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => Frame::Integer(map.len() as i64),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn hkeys(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                let arr = map.keys()
+                    .map(|k| Frame::Bulk(k.as_bytes().to_vec()))
+                    .collect();
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
+
+    pub async fn hvals(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+        
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                let arr = map.values()
+                    .map(|v| Frame::Bulk(v.clone()))
+                    .collect();
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
         }
     }
 }
