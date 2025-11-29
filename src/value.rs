@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::list::ListState;
 use crate::skiplist::SkipList;
@@ -7,8 +7,9 @@ use crate::skiplist::SkipList;
 pub enum Value {
     String(Vec<u8>),
     List(ListState),
-    ZSet(SkipList),
     Hash(HashMap<String, Vec<u8>>),
+    Set(HashSet<Vec<u8>>),
+    ZSet(SkipList),
 }
 
 impl Value {
@@ -22,6 +23,13 @@ impl Value {
     pub fn as_hash_mut(&mut self) -> Option<&mut HashMap<String, Vec<u8>>> {
         match self {
             Value::Hash(ref mut h) => Some(h),
+            _ => None,
+        }
+    }
+
+    pub fn as_set_mut(&mut self) -> Option<&mut HashSet<Vec<u8>>> {
+        match self {
+            Value::Set(ref mut s) => Some(s),
             _ => None,
         }
     }

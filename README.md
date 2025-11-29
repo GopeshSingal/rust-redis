@@ -1,1 +1,3 @@
 # rust-redis
+
+A lightweight clone implementation of [Redis](https://redis.io/docs/latest/) using [Rust](https://rust-lang.org/). Because Redis is originally implemented in the C programming language, attempting an implementation in Rust seemed logical, as well as a convenient excuse to learn the language. In general, one of the greatest strengths of C is its reputation; that is, because it has been around far longer, the general ecosystem of programming has slowly been crafted to adhere to it. However, newer languages, such as Rust, have potential to circumvent common pitfalls and introduce a better coding experience. Thus, it is crucial to consider how core tools in 'older' languages could be recreated in more-modern frameworks.
