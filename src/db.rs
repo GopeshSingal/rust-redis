@@ -72,17 +72,30 @@ impl Db {
     pub async fn apply(&self, cmd: Command) -> Frame {
         match cmd {
             Command::Ping => Frame::Simple("PONG".to_string()),
+
+            // String commands
             Command::Get(key) => self.get(&key).await,
             Command::Set(key, val) => self.set(key, val).await,
+            Command::Del(key) => self.del(&key).await,
+            Command::Append(key, val) => self.append(key, val).await,
+            Command::StrLen(key) => self.strlen(key).await,
+            Command::GetSet(key, val) => self.getset(key, val).await,
+            Command::Incr(key) => self.incr(key).await,
+            Command::IncrBy(key, amt) => self.incrby(key, amt).await,
+            Command::MSet(kvs) => self.mset(kvs).await,
+            Command::MGet(keys) => self.mget(keys).await,
+
+            // List commands
             Command::LPush(key, vals) => self.lpush(key, vals).await,
             Command::RPop(key) => self.rpop(&key).await,
             Command::BRPop(key, timeout) => self.brpop(key, timeout).await,
-            Command::Del(key) => self.del(&key).await,
             Command::Expire(key, secs) => self.expire(key, secs).await,
             Command::Ttl(key) => self.ttl(&key).await,
             Command::ZAdd(key, score, member) => self.zadd(key, score, member).await,
             Command::ZRangeByScore(key, min, max) => self.zrange_by_score(key, min, max).await,
             Command::ZRem(key, member) => self.zrem(key, member).await,
+
+            // Hash commands
             Command::HSet(key, field, value) => self.hset(key, field, value).await,
             Command::HGet(key, field) => self.hget(key, field).await,
             Command::HDel(key, fields) => self.hdel(key, fields).await,
@@ -92,6 +105,8 @@ impl Db {
             Command::HLen(key) => self.hlen(key).await,
             Command::HKeys(key) => self.hkeys(key).await,
             Command::HVals(key) => self.hvals(key).await,
+
+            // Set commands
             Command::SAdd(key, members) => self.sadd(key, members).await,
             Command::SRem(key, members) => self.srem(key, members).await,
             Command::SMembers(key) => self.smembers(key).await,
@@ -120,6 +135,150 @@ impl Db {
         let mut inner = self.inner.write().await;
         inner.insert(key, Value::String(val));
         Frame::Simple("OK".into())
+    }
+
+    async fn del(&self, key: &str) -> Frame {
+        if self.check_and_purge(key).await {
+            return Frame::Integer(0);
+        }
+        
+        let mut inner = self.inner.write().await;
+        let removed = inner.remove(key).is_some();
+
+        let mut ttl = self.ttl.write().await;
+        ttl.remove(key);
+
+        Frame::Integer(removed as i64)
+    }
+
+    async fn append(&self, key: String, val: Vec<u8>) -> Frame {
+        self.check_and_purge(&key).await;
+        let mut inner = self.inner.write().await;
+
+        match inner.get_mut(&key) {
+            Some(Value::String(s)) => {
+                s.extend_from_slice(&val);
+                Frame::Integer(s.len() as i64)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => {
+                inner.insert(key.clone(), Value::String(val.clone()));
+                Frame::Integer(val.len() as i64)
+            }
+        }
+    }
+
+    async fn strlen(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::String(s)) => Frame::Integer(s.len() as i64),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn getset(&self, key: String, val: Vec<u8>) -> Frame {
+        self.check_and_purge(&key).await;
+
+        let mut inner = self.inner.write().await;
+
+        let old = match inner.get(&key) {
+            Some(Value::String(s)) => Frame::Bulk(s.clone()),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Null,
+        };
+
+        inner.insert(key, Value::String(val));
+        old
+    }
+
+    async fn incr(&self, key: String) -> Frame {
+        self.check_and_purge(&key).await;
+
+        let mut inner = self.inner.write().await;
+
+        let curr = match inner.get(&key) {
+            Some(Value::String(s)) => {
+                let s = match std::str::from_utf8(s) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Frame::Error("ERR value is not an integer".into());
+                    }
+                };
+                match s.parse::<i64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Frame::Error("ERR value is not an integer".into());
+                    }
+                }
+            }
+            Some(_) => return Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => 0,
+        };
+
+        let new_val = curr + 1;
+        inner.insert(key, Value::String(new_val.to_string().into_bytes()));
+        Frame::Integer(new_val)
+    }
+
+    async fn incrby(&self, key: String, amt: i64) -> Frame {
+        self.check_and_purge(&key).await;
+
+        let mut inner = self.inner.write().await;
+
+        let curr = match inner.get(&key) {
+            Some(Value::String(s)) => {
+                let s = match std::str::from_utf8(s) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Frame::Error("ERR value is not an integer".into());
+                    }
+                };
+                match s.parse::<i64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Frame::Error("ERR value is not an integer".into());
+                    }
+                }
+            }
+            Some(_) => return Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => 0,
+        };
+
+        let new_val = curr + amt;
+        inner.insert(key, Value::String(new_val.to_string().into_bytes()));
+        Frame::Integer(new_val)
+    }
+
+    async fn mset(&self, kvs: Vec<(String, Vec<u8>)>) -> Frame {
+        let mut inner = self.inner.write().await;
+
+        for (k, v) in kvs {
+            inner.insert(k, Value::String(v));
+        }
+
+        Frame::Simple("OK".into())
+    }
+
+    async fn mget(&self, keys: Vec<String>) -> Frame {
+        let inner = self.inner.read().await;
+
+        let mut arr = Vec::new();
+
+        for k in keys {
+            match inner.get(&k) {
+                Some(Value::String(s)) => arr.push(Frame::Bulk(s.clone())),
+                Some(_) => arr.push(Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())),
+                None => arr.push(Frame::Null),
+            }
+        }
+
+        Frame::Array(arr)
     }
 
     async fn lpush(&self, key: String, vals: Vec<Vec<u8>>) -> Frame {
@@ -225,21 +384,6 @@ impl Db {
                 return Frame::Null;
             }
         }
-    }
-
-
-    async fn del(&self, key: &str) -> Frame {
-        if self.check_and_purge(key).await {
-            return Frame::Integer(0);
-        }
-        
-        let mut inner = self.inner.write().await;
-        let removed = inner.remove(key).is_some();
-
-        let mut ttl = self.ttl.write().await;
-        ttl.remove(key);
-
-        Frame::Integer(removed as i64)
     }
 
     async fn expire(&self, key: String, secs: usize) -> Frame {

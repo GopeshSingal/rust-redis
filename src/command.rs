@@ -4,12 +4,23 @@ use crate::resp::Frame;
 #[derive(Debug)]
 pub enum Command {
     Ping,
+
+    // String commands
     Get(String),
     Set(String, Vec<u8>),
+    Del(String),
+    Append(String, Vec<u8>),
+    StrLen(String),
+    GetSet(String, Vec<u8>),
+    Incr(String),
+    IncrBy(String, i64),
+    MSet(Vec<(String, Vec<u8>)>),
+    MGet(Vec<String>),
+
+    // List Commands
     LPush(String, Vec<Vec<u8>>),
     RPop(String),
     BRPop(String, usize),
-    Del(String),
     Expire(String, usize),
     Ttl(String),
     ZAdd(String, f64, Vec<u8>),
@@ -59,6 +70,8 @@ impl TryFrom<Frame> for Command {
 
         match cmd_name.as_str() {
             "PING" => Ok(Command::Ping),
+
+            // String commands
             "GET" => {
                 if arr.len() != 2 {
                     return Err(RedisError::Other("ERR wrong number of arguments for 'GET'".into()));
@@ -74,6 +87,77 @@ impl TryFrom<Frame> for Command {
                 let val = frame_to_bytes(&arr[2])?;
                 Ok(Command::Set(key, val))
             }
+            "DEL" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'DEL'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::Del(key))
+            }
+            "APPEND" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'APPEND'".into()));
+                }
+                Ok(Command::Append(
+                    frame_to_string(&arr[1])?,
+                    frame_to_bytes(&arr[2])?,
+                ))
+            }
+            "STRLEN" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'STRLEN'".into()));
+                }
+                Ok(Command::StrLen(frame_to_string(&arr[1])?))
+            }
+            "GETSET" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'GETSET'".into()));
+                }
+                Ok(Command::GetSet(
+                    frame_to_string(&arr[1])?,
+                    frame_to_bytes(&arr[2])?,
+                ))
+            }
+            "INCR" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'INCR'".into()));
+                }
+                Ok(Command::Incr(frame_to_string(&arr[1])?))
+            }
+            "INCRBY" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'INCRBY'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let amt_str = frame_to_string(&arr[2])?;
+                let amt = amt_str.parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                Ok(Command::IncrBy(key, amt))
+            }
+            "MSET" => {
+                if arr.len() < 3 || arr.len() % 2 == 0 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'MSET'".into()));
+                }
+                let mut kvs = Vec::new();
+                for pair in arr[1..].chunks(2) {
+                    let key = frame_to_string(&pair[0])?;
+                    let val = frame_to_bytes(&pair[1])?;
+                    kvs.push((key, val));
+                }
+                Ok(Command::MSet(kvs))
+            }
+            "MGET" => {
+                if arr.len() < 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'MGET'".into()));
+                }
+                let mut keys = Vec::new();
+                for k in &arr[1..] {
+                    keys.push(frame_to_string(k)?);
+                }
+                Ok(Command::MGet(keys))
+            }
+
+            // List commands
             "LPUSH" => {
                 if arr.len() < 3 {
                     return Err(RedisError::Other("ERR wrong number of arguments for 'LPUSH'".into()));
@@ -102,13 +186,6 @@ impl TryFrom<Frame> for Command {
                     RedisError::Other("ERR timeout must be integer".into())
                 })?;
                 Ok(Command::BRPop(key, timeout))
-            }
-            "DEL" => {
-                if arr.len() != 2 {
-                    return Err(RedisError::Other("ERR wrong number of arguments for 'DEL'".into()));
-                }
-                let key = frame_to_string(&arr[1])?;
-                Ok(Command::Del(key))
             }
             "EXPIRE" => {
                 if arr.len() != 3 {
