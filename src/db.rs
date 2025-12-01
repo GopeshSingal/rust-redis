@@ -87,8 +87,17 @@ impl Db {
 
             // List commands
             Command::LPush(key, vals) => self.lpush(key, vals).await,
+            Command::LPop(key) => self.lpop(key).await,
+            Command::RPush(key, vals) => self.rpush(key, vals).await,
             Command::RPop(key) => self.rpop(&key).await,
+            Command::LLen(key) => self.llen(key).await,
+            Command::LRange(key, s, e) => self.lrange(key, s, e).await,
+            Command::LIndex(key, idx) => self.lindex(key, idx).await,
+            Command::LSet(key, idx, val) => self.lset(key, idx, val).await,
+            Command::LTrim(key, s, e) => self.ltrim(key, s, e).await,
             Command::BRPop(key, timeout) => self.brpop(key, timeout).await,
+
+            // Sorted Set commands
             Command::Expire(key, secs) => self.expire(key, secs).await,
             Command::Ttl(key) => self.ttl(&key).await,
             Command::ZAdd(key, score, member) => self.zadd(key, score, member).await,
@@ -298,11 +307,51 @@ impl Db {
         }
     }
 
+    async fn lpop(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Null;
+        }
+
+        let mut inner = self.inner.write().await;
+
+        match inner.get_mut(&key) {
+            Some(Value::List(list)) => {
+                if let Some(v) = list.data.pop_front() {
+                    Frame::Bulk(v)
+                } else {
+                    Frame::Null
+                }
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Null,
+        }
+    }
+
+    async fn rpush(&self, key: String, vals: Vec<Vec<u8>>) -> Frame {
+        self.check_and_purge(&key).await;
+
+        let mut inner = self.inner.write().await;
+        let entry = inner.entry(key).or_insert_with(|| Value::List(ListState::new()));
+
+        match entry {
+            Value::List(list) => {
+                for v in vals {
+                    list.data.push_back(v);
+                }
+                list.notify.notify_one();
+                Frame::Integer(list.data.len() as i64)
+            }
+            _ => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+        }
+    }
+
     async fn rpop(&self, key: &str) -> Frame {
         if self.check_and_purge(key).await {
             return Frame::Null;
         }
+
         let mut inner = self.inner.write().await;
+
         let value_opt = inner.get_mut(key);
         if let Some(value) = value_opt {
             if let Some(list) = value.as_list_mut() {
@@ -316,6 +365,147 @@ impl Db {
             }
         }
         Frame::Null
+    }
+
+    async fn llen(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::List(list)) => Frame::Integer(list.data.len() as i64),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn lindex(&self, key: String, index: i64) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Null;
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::List(list)) => {
+                let len = list.data.len() as i64;
+
+                let idx = if index < 0 {
+                    len + index
+                } else {
+                    index
+                };
+
+                if idx < 0 || idx >= len {
+                    Frame::Null
+                } else {
+                    Frame::Bulk(list.data[idx as usize].clone())
+                }
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Null,
+        }
+    }
+
+    async fn lset(&self, key: String, index: i64, val: Vec<u8>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Error("ERR no such key".into());
+        }
+
+        let mut inner = self.inner.write().await;
+
+        match inner.get_mut(&key) {
+            Some(Value::List(list)) => {
+                let len = list.data.len() as i64;
+
+                let idx = if index < 0 {
+                    len + index
+                } else {
+                    index
+                };
+
+                if idx < 0 || idx >= len {
+                    return Frame::Error("ERR index out of range".into());
+                }
+
+                list.data[idx as usize] = val;
+                Frame::Simple("OK".into())
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Error("ERR no such key".into()),
+        }
+    }
+
+    async fn lrange(&self, key: String, start: i64, end: i64) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::List(list)) => {
+                let len = list.data.len() as i64;
+
+                let s = if start < 0 { len + start } else { start }.max(0);
+                let e = if end < 0 { len + end } else { end }.max(0);
+
+                if s > e || s >= len {
+                    return Frame::Array(vec![]);
+                }
+
+                let e = e.min(len - 1);
+
+                let result = list.data
+                    .iter()
+                    .skip(s as usize)
+                    .take((e - s + 1) as usize)
+                    .cloned()
+                    .map(Frame::Bulk)
+                    .collect::<Vec<_>>();
+
+                Frame::Array(result)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
+
+    async fn ltrim(&self, key: String, start: i64, end: i64) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Simple("OK".into());
+        }
+
+        let mut inner = self.inner.write().await;
+
+        match inner.get_mut(&key) {
+            Some(Value::List(list)) => {
+                let len = list.data.len() as i64;
+
+                let s = if start < 0 { len + start } else { start }.max(0);
+                let e = if end < 0 { len + end } else { end }.max(0);
+
+                if s > e || s >= len {
+                    list.data.clear();
+                    return Frame::Simple("OK".into());
+                }
+
+                let e = e.min(len - 1);
+
+                list.data = list.data
+                    .iter()
+                    .skip(s as usize)
+                    .take((e - s + 1) as usize)
+                    .cloned()
+                    .collect();
+
+                Frame::Simple("OK".into())
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Simple("OK".into()),
+        }
     }
 
     async fn brpop(&self, key: String, timeout_secs: usize) -> Frame {

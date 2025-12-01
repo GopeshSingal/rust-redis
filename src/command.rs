@@ -19,8 +19,17 @@ pub enum Command {
 
     // List Commands
     LPush(String, Vec<Vec<u8>>),
+    LPop(String),
+    RPush(String, Vec<Vec<u8>>),
     RPop(String),
+    LLen(String),
+    LRange(String, i64, i64),
+    LIndex(String, i64),
+    LSet(String, i64, Vec<u8>),
+    LTrim(String, i64, i64),
     BRPop(String, usize),
+
+    // Sorted Set Commands
     Expire(String, usize),
     Ttl(String),
     ZAdd(String, f64, Vec<u8>),
@@ -169,12 +178,76 @@ impl TryFrom<Frame> for Command {
                 }
                 Ok(Command::LPush(key, vals))
             }
+            "LPOP" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'LPOP'".into()));
+                }
+                Ok(Command::LPop(frame_to_string(&arr[1])?))
+            }
+            "RPUSH" => {
+                if arr.len() < 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'RPUSH'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let mut vals = Vec::new();
+                for f in &arr[2..] {
+                    vals.push(frame_to_bytes(f)?);
+                }
+                Ok(Command::RPush(key, vals))
+            }
             "RPOP" => {
                 if arr.len() != 2 {
                     return Err(RedisError::Other("ERR wrong number of arguments for 'RPOP'".into()));
                 }
                 let key = frame_to_string(&arr[1])?;
                 Ok(Command::RPop(key))
+            }
+            "LLEN" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'LLEN'".into()));
+                }
+                Ok(Command::LLen(frame_to_string(&arr[1])?))
+            }
+            "LRANGE" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'LRANGE'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let start = frame_to_string(&arr[2])?.parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                let stop = frame_to_string(&arr[3])?.parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                Ok(Command::LRange(key, start, stop))
+            }
+            "LINDEX" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'LINDEX'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let index = frame_to_string(&arr[2])?.parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                Ok(Command::LIndex(key, index))
+            }
+            "LSET" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'LSET'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let index = frame_to_string(&arr[2])?.parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                let value = frame_to_bytes(&arr[3])?;
+                Ok(Command::LSet(key, index, value))
+            }
+            "LTRIM" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'LTRIM'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let start = frame_to_string(&arr[2])?.parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                let stop = frame_to_string(&arr[3])?.parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                Ok(Command::LTrim(key, start, stop))
             }
             "BRPOP" => {
                 if arr.len() != 3 {
@@ -187,6 +260,8 @@ impl TryFrom<Frame> for Command {
                 })?;
                 Ok(Command::BRPop(key, timeout))
             }
+
+            // Sorted Set commands
             "EXPIRE" => {
                 if arr.len() != 3 {
                     return Err(RedisError::Other("ERR wrong number of arguments for 'EXPIRE'".into()));
