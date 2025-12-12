@@ -1,0 +1,16 @@
+# Dockerfile.dev
+FROM rust:1-bookworm
+
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends \
+		redis-tools \
+		pkg-config \
+		libssl-dev \
+		git \
+		curl \
+		netcat-traditional \
+		neovim \
+		tmux \
+	&& rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
