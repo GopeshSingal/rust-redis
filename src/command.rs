@@ -6,6 +6,10 @@ pub enum Command {
     Ping,
     
     // Keyspace commands
+    Exists(Vec<String>),
+    Type(String),
+    Keys(String),
+    RandomKey,
     Expire(String, usize),
     Ttl(String),
 
@@ -91,6 +95,36 @@ impl TryFrom<Frame> for Command {
             "PING" => Ok(Command::Ping),
             
             // Keyspace commands
+            "EXISTS" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'EXISTS'".into()));
+                }
+                let mut keys = Vec::new();
+                for k in &arr[1..] {
+                    keys.push(frame_to_string(k)?);
+                }
+                Ok(Command::Exists(keys))
+            }
+            "TYPE" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'TYPE'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::Type(key))
+            }
+            "KEYS" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'KEYS'".into()));
+                }
+                let pattern = frame_to_string(&arr[1])?;
+                Ok(Command::Keys(pattern))
+            }
+            "RANDOMKEY" => {
+                if arr.len() != 1 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'RANDOMKEY'".into()));
+                }
+                Ok(Command::RandomKey)
+            }
             "EXPIRE" => {
                 if arr.len() != 3 {
                     return Err(RedisError::Other("ERR wrong number of arguments for 'EXPIRE'".into()));

@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 
+use rand::Rng;
+
 use tokio::sync::RwLock;
 use tokio::time;
 
@@ -74,6 +76,10 @@ impl Db {
             Command::Ping => Frame::Simple("PONG".to_string()),
             
             // Keyspace commands
+            Command::Exists(keys) => self.exists(keys).await,
+            Command::Type(key) => self.r#type(key).await,
+            Command::Keys(pattern) => self.keys(pattern).await,
+            Command::RandomKey => self.randomkey().await,
             Command::Expire(key, secs) => self.expire(key, secs).await,
             Command::Ttl(key) => self.ttl(&key).await,
             
@@ -169,6 +175,121 @@ impl Db {
 
         Frame::Integer(removed as i64)
     }
+
+    // ------- KEYSPACE ------- //
+
+    async fn exists(&self, keys: Vec<String>) -> Frame {
+        let mut count = 0;
+
+        for key in keys {
+            if self.check_and_purge(&key).await {
+                continue;
+            }
+
+            let inner = self.inner.read().await;
+            if inner.contains_key(&key) {
+                count += 1;
+            }
+        }
+        
+        Frame::Integer(count)
+    }
+
+    async fn r#type(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Simple("none".into());
+        }
+
+        let inner = self.inner.read().await;
+
+        let t = match inner.get(&key) {
+            None => "none",
+            Some(Value::String(_)) => "string",
+            Some(Value::List(_)) => "list",
+            Some(Value::Hash(_)) => "hash",
+            Some(Value::Set(_)) => "set",
+            Some(Value::ZSet(_)) => "zset",
+        };
+
+        Frame::Simple(t.into())
+    }
+
+    async fn keys(&self, pattern: String) -> Frame {
+        // Currently only works for exact matches
+        fn key_matches(pattern: &str, key: &str) -> bool {
+            if pattern == "*" {
+                true
+            } else {
+                pattern == key
+            }
+        }
+
+        // Currently not using TTL checks to avoid complications
+        let inner = self.inner.read().await;
+        let mut arr = Vec::new();
+        for k in inner.keys() {
+            if key_matches(&pattern, k) {
+                arr.push(Frame::Bulk(k.as_bytes().to_vec()));
+            }
+        }
+
+        Frame::Array(arr)
+    }
+
+    async fn randomkey(&self) -> Frame {
+        let inner = self.inner.read().await;
+
+        if inner.is_empty() {
+            return Frame::Null;
+        }
+
+        let mut rng = rand::thread_rng();
+        let idx = rng.gen_range(0..inner.len());
+
+        if let Some(key) = inner.keys().nth(idx) {
+            Frame::Bulk(key.as_bytes().to_vec())
+        } else {
+            Frame::Null
+        }
+    }
+
+    async fn expire(&self, key: String, secs: usize) -> Frame {
+        let inner = self.inner.read().await;
+        if !inner.contains_key(&key) {
+            return Frame::Integer(0);
+        }
+
+        drop(inner);
+
+        let mut ttl = self.ttl.write().await;
+        ttl.insert(key, Instant::now() + Duration::from_secs(secs as u64));
+        Frame::Integer(1)
+    }
+
+    async fn ttl(&self, key: &str) -> Frame {
+        let inner = self.inner.read().await;
+        if !inner.contains_key(key) {
+            return Frame::Integer(-2);
+        }
+
+        drop(inner);
+
+        let ttl = self.ttl.read().await;
+        if let Some(exp_at) = ttl.get(key) {
+            let now = Instant::now();
+
+            if now >= *exp_at {
+                return Frame::Integer(-2);
+            }
+
+            let remaining = (*exp_at - now).as_secs() as i64;
+            Frame::Integer(remaining)
+        } else {
+            Frame::Integer(-1)
+        }
+    }
+
+    // ------- LIST ------- //
 
     async fn append(&self, key: String, val: Vec<u8>) -> Frame {
         self.check_and_purge(&key).await;
@@ -586,41 +707,361 @@ impl Db {
         }
     }
 
-    async fn expire(&self, key: String, secs: usize) -> Frame {
+    // ------- HASH ------- //
+
+    async fn hset(&self, key: String, field: String, value: Vec<u8>) -> Frame {
+        self.check_and_purge(&key).await;
+
+        let mut inner = self.inner.write().await;
+
+        let entry = inner.entry(key).or_insert_with(|| {
+            Value::Hash(HashMap::new())
+        });
+
+        match entry {
+            Value::Hash(map) => {
+                let existed = map.insert(field, value).is_some();
+                Frame::Integer(if existed { 0 } else { 1 })
+            }
+            _ => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
+        }
+    }
+
+    async fn hget(&self, key: String, field: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Null;
+        }
+
         let inner = self.inner.read().await;
-        if !inner.contains_key(&key) {
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                match map.get(&field) {
+                    Some(val) => Frame::Bulk(val.clone()),
+                    None => Frame::Null,
+                }
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Null,
+        }
+    }
+
+    async fn hdel(&self, key: String, fields: Vec<String>) -> Frame {
+        if self.check_and_purge(&key).await {
             return Frame::Integer(0);
         }
 
-        drop(inner);
+        let mut inner = self.inner.write().await;
 
-        let mut ttl = self.ttl.write().await;
-        ttl.insert(key, Instant::now() + Duration::from_secs(secs as u64));
-        Frame::Integer(1)
+        match inner.get_mut(&key) {
+            Some(Value::Hash(map)) => {
+                let mut removed = 0;
+                for f in fields {
+                    if map.remove(&f).is_some() {
+                        removed += 1;
+                    }
+                }
+                Frame::Integer(removed)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
     }
 
-    async fn ttl(&self, key: &str) -> Frame {
-        let inner = self.inner.read().await;
-        if !inner.contains_key(key) {
-            return Frame::Integer(-2);
+    async fn hgetall(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
         }
 
-        drop(inner);
+        let inner = self.inner.read().await;
 
-        let ttl = self.ttl.read().await;
-        if let Some(exp_at) = ttl.get(key) {
-            let now = Instant::now();
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                let mut arr = Vec::new();
+                for (k, v) in map {
+                    arr.push(Frame::Bulk(k.as_bytes().to_vec()));
+                    arr.push(Frame::Bulk(v.clone()));
+                }
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
 
-            if now >= *exp_at {
-                return Frame::Integer(-2);
+    async fn hmget(&self, key: String, fields: Vec<String>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![Frame::Null; fields.len()])
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                let mut arr = Vec::new();
+                for f in fields {
+                    match map.get(&f) {
+                        Some(v) => arr.push(Frame::Bulk(v.clone())),
+                        None => arr.push(Frame::Null),
+                    }
+                }
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![Frame::Null; fields.len()]),
+        }
+    }
+
+    async fn hexists(&self, key: String, field: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) =>
+                Frame::Integer(if map.contains_key(&field) { 1 } else { 0 }),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn hlen(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => Frame::Integer(map.len() as i64),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn hkeys(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                let arr = map.keys()
+                    .map(|k| Frame::Bulk(k.as_bytes().to_vec()))
+                    .collect();
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
+
+    async fn hvals(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Hash(map)) => {
+                let arr = map.values()
+                    .map(|v| Frame::Bulk(v.clone()))
+                    .collect();
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
+
+    // ------- SET ------- //
+
+    async fn sadd(&self, key: String, members: Vec<Vec<u8>>) -> Frame {
+        self.check_and_purge(&key).await;
+
+        let mut inner = self.inner.write().await;
+
+        let entry = inner.entry(key).or_insert_with(|| Value::Set(HashSet::new()));
+
+        match entry {
+            Value::Set(set) => {
+                let mut added = 0;
+                for m in members {
+                    if set.insert(m) {
+                        added += 1;
+                    }
+                }
+                Frame::Integer(added)
+            }
+            _ => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+        }
+    }
+
+    async fn srem(&self, key: String, members: Vec<Vec<u8>>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let mut inner = self.inner.write().await;
+
+        match inner.get_mut(&key) {
+            Some(Value::Set(set)) => {
+                let mut removed = 0;
+                for m in members {
+                    if set.remove(&m) {
+                        removed += 1;
+                    }
+                }
+                Frame::Integer(removed)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn smembers(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Set(set)) => {
+                let arr = set.iter()
+                    .map(|v| Frame::Bulk(v.clone()))
+                    .collect();
+                Frame::Array(arr)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
+
+    async fn sismember(&self, key: String, member: Vec<u8>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Set(set)) => 
+                Frame::Integer(if set.contains(&member) { 1 } else { 0 }),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn scard(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::Set(set)) => Frame::Integer(set.len() as i64),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn sunion(&self, keys: Vec<String>) -> Frame {
+        let inner = self.inner.read().await;
+
+        let mut result = HashSet::new();
+
+        for k in keys {
+            if self.is_expired(&k).await {
+                continue;
             }
 
-            let remaining = (*exp_at - now).as_secs() as i64;
-            Frame::Integer(remaining)
-        } else {
-            Frame::Integer(-1)
+            if let Some(Value::Set(set)) = inner.get(&k) {
+                for v in set {
+                    result.insert(v.clone());
+                }
+            }
         }
+
+        let arr = result.into_iter().map(Frame::Bulk).collect();
+        Frame::Array(arr)
     }
+
+    async fn sinter(&self, keys: Vec<String>) -> Frame {
+        let inner = self.inner.read().await;
+
+        if keys.is_empty() {
+            return Frame::Array(vec![]);
+        }
+
+        let mut iter = keys.iter();
+
+        let mut base: Option<HashSet<Vec<u8>>> = None;
+
+        for k in &keys {
+            if self.is_expired(&k).await {
+                continue;
+            }
+
+            if let Some(Value::Set(set)) = inner.get(k) {
+                base = Some(set.clone());
+                break;
+            }
+        }
+
+        let Some(mut acc) = base else {
+            return Frame::Array(vec![]);
+        };
+
+        for k in &keys {
+            if let Some(Value::Set(set)) = inner.get(k) {
+                acc = acc.intersection(set).cloned().collect();
+            }
+        }
+
+        let arr = acc.into_iter().map(Frame::Bulk).collect();
+        Frame::Array(arr)
+    }
+
+    async fn sdiff(&self, keys: Vec<String>) -> Frame {
+        let inner = self.inner.read().await;
+
+        if keys.is_empty() {
+            return Frame::Array(vec![]);
+        }
+
+        let first = &keys[0];
+
+        if self.is_expired(first).await {
+            return Frame::Array(vec![]);
+        }
+
+        let base = match inner.get(first) {
+            Some(Value::Set(set)) => set.clone(),
+            _ => HashSet::new(),
+        };
+
+        let mut result = base;
+
+        for k in keys.iter().skip(1) {
+            if let Some(Value::Set(set)) = inner.get(k) {
+                for m in set {
+                    result.remove(m);
+                }
+            }
+        }
+
+        let arr = result.into_iter().map(Frame::Bulk).collect();
+        Frame::Array(arr)
+    }
+
+    // ------- SORTED SET ------- //
 
     async fn zadd(&self, key: String, score: f64, member: Vec<u8>) -> Frame {
         self.check_and_purge(&key).await;
@@ -856,356 +1297,5 @@ impl Db {
             Some(_) => Frame::Error("WRONGTYPE Operation against a keyholding the wrong kind of value".into()),
             None => Frame::Null,
         }
-    }
-
-    // Hash commands
-    async fn hset(&self, key: String, field: String, value: Vec<u8>) -> Frame {
-        self.check_and_purge(&key).await;
-
-        let mut inner = self.inner.write().await;
-
-        let entry = inner.entry(key).or_insert_with(|| {
-            Value::Hash(HashMap::new())
-        });
-
-        match entry {
-            Value::Hash(map) => {
-                let existed = map.insert(field, value).is_some();
-                Frame::Integer(if existed { 0 } else { 1 })
-            }
-            _ => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
-        }
-    }
-
-    async fn hget(&self, key: String, field: String) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Null;
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Hash(map)) => {
-                match map.get(&field) {
-                    Some(val) => Frame::Bulk(val.clone()),
-                    None => Frame::Null,
-                }
-            }
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Null,
-        }
-    }
-
-    async fn hdel(&self, key: String, fields: Vec<String>) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Integer(0);
-        }
-
-        let mut inner = self.inner.write().await;
-
-        match inner.get_mut(&key) {
-            Some(Value::Hash(map)) => {
-                let mut removed = 0;
-                for f in fields {
-                    if map.remove(&f).is_some() {
-                        removed += 1;
-                    }
-                }
-                Frame::Integer(removed)
-            }
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Integer(0),
-        }
-    }
-
-    async fn hgetall(&self, key: String) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Array(vec![]);
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Hash(map)) => {
-                let mut arr = Vec::new();
-                for (k, v) in map {
-                    arr.push(Frame::Bulk(k.as_bytes().to_vec()));
-                    arr.push(Frame::Bulk(v.clone()));
-                }
-                Frame::Array(arr)
-            }
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Array(vec![]),
-        }
-    }
-
-    async fn hmget(&self, key: String, fields: Vec<String>) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Array(vec![Frame::Null; fields.len()])
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Hash(map)) => {
-                let mut arr = Vec::new();
-                for f in fields {
-                    match map.get(&f) {
-                        Some(v) => arr.push(Frame::Bulk(v.clone())),
-                        None => arr.push(Frame::Null),
-                    }
-                }
-                Frame::Array(arr)
-            }
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Array(vec![Frame::Null; fields.len()]),
-        }
-    }
-
-    async fn hexists(&self, key: String, field: String) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Integer(0);
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Hash(map)) =>
-                Frame::Integer(if map.contains_key(&field) { 1 } else { 0 }),
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Integer(0),
-        }
-    }
-
-    async fn hlen(&self, key: String) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Integer(0);
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Hash(map)) => Frame::Integer(map.len() as i64),
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Integer(0),
-        }
-    }
-
-    async fn hkeys(&self, key: String) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Array(vec![]);
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Hash(map)) => {
-                let arr = map.keys()
-                    .map(|k| Frame::Bulk(k.as_bytes().to_vec()))
-                    .collect();
-                Frame::Array(arr)
-            }
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Array(vec![]),
-        }
-    }
-
-    async fn hvals(&self, key: String) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Array(vec![]);
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Hash(map)) => {
-                let arr = map.values()
-                    .map(|v| Frame::Bulk(v.clone()))
-                    .collect();
-                Frame::Array(arr)
-            }
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Array(vec![]),
-        }
-    }
-
-    async fn sadd(&self, key: String, members: Vec<Vec<u8>>) -> Frame {
-        self.check_and_purge(&key).await;
-
-        let mut inner = self.inner.write().await;
-
-        let entry = inner.entry(key).or_insert_with(|| Value::Set(HashSet::new()));
-
-        match entry {
-            Value::Set(set) => {
-                let mut added = 0;
-                for m in members {
-                    if set.insert(m) {
-                        added += 1;
-                    }
-                }
-                Frame::Integer(added)
-            }
-            _ => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-        }
-    }
-
-    async fn srem(&self, key: String, members: Vec<Vec<u8>>) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Integer(0);
-        }
-
-        let mut inner = self.inner.write().await;
-
-        match inner.get_mut(&key) {
-            Some(Value::Set(set)) => {
-                let mut removed = 0;
-                for m in members {
-                    if set.remove(&m) {
-                        removed += 1;
-                    }
-                }
-                Frame::Integer(removed)
-            }
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Integer(0),
-        }
-    }
-
-    async fn smembers(&self, key: String) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Array(vec![]);
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Set(set)) => {
-                let arr = set.iter()
-                    .map(|v| Frame::Bulk(v.clone()))
-                    .collect();
-                Frame::Array(arr)
-            }
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Array(vec![]),
-        }
-    }
-
-    async fn sismember(&self, key: String, member: Vec<u8>) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Integer(0);
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Set(set)) => 
-                Frame::Integer(if set.contains(&member) { 1 } else { 0 }),
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Integer(0),
-        }
-    }
-
-    async fn scard(&self, key: String) -> Frame {
-        if self.check_and_purge(&key).await {
-            return Frame::Integer(0);
-        }
-
-        let inner = self.inner.read().await;
-
-        match inner.get(&key) {
-            Some(Value::Set(set)) => Frame::Integer(set.len() as i64),
-            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
-            None => Frame::Integer(0),
-        }
-    }
-
-    async fn sunion(&self, keys: Vec<String>) -> Frame {
-        let inner = self.inner.read().await;
-
-        let mut result = HashSet::new();
-
-        for k in keys {
-            if self.is_expired(&k).await {
-                continue;
-            }
-
-            if let Some(Value::Set(set)) = inner.get(&k) {
-                for v in set {
-                    result.insert(v.clone());
-                }
-            }
-        }
-
-        let arr = result.into_iter().map(Frame::Bulk).collect();
-        Frame::Array(arr)
-    }
-
-    async fn sinter(&self, keys: Vec<String>) -> Frame {
-        let inner = self.inner.read().await;
-
-        if keys.is_empty() {
-            return Frame::Array(vec![]);
-        }
-
-        let mut iter = keys.iter();
-
-        let mut base: Option<HashSet<Vec<u8>>> = None;
-
-        for k in &keys {
-            if self.is_expired(&k).await {
-                continue;
-            }
-
-            if let Some(Value::Set(set)) = inner.get(k) {
-                base = Some(set.clone());
-                break;
-            }
-        }
-
-        let Some(mut acc) = base else {
-            return Frame::Array(vec![]);
-        };
-
-        for k in &keys {
-            if let Some(Value::Set(set)) = inner.get(k) {
-                acc = acc.intersection(set).cloned().collect();
-            }
-        }
-
-        let arr = acc.into_iter().map(Frame::Bulk).collect();
-        Frame::Array(arr)
-    }
-
-    async fn sdiff(&self, keys: Vec<String>) -> Frame {
-        let inner = self.inner.read().await;
-
-        if keys.is_empty() {
-            return Frame::Array(vec![]);
-        }
-
-        let first = &keys[0];
-
-        if self.is_expired(first).await {
-            return Frame::Array(vec![]);
-        }
-
-        let base = match inner.get(first) {
-            Some(Value::Set(set)) => set.clone(),
-            _ => HashSet::new(),
-        };
-
-        let mut result = base;
-
-        for k in keys.iter().skip(1) {
-            if let Some(Value::Set(set)) = inner.get(k) {
-                for m in set {
-                    result.remove(m);
-                }
-            }
-        }
-
-        let arr = result.into_iter().map(Frame::Bulk).collect();
-        Frame::Array(arr)
     }
 }
