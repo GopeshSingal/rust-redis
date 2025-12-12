@@ -72,7 +72,11 @@ impl Db {
     pub async fn apply(&self, cmd: Command) -> Frame {
         match cmd {
             Command::Ping => Frame::Simple("PONG".to_string()),
-
+            
+            // Keyspace commands
+            Command::Expire(key, secs) => self.expire(key, secs).await,
+            Command::Ttl(key) => self.ttl(&key).await,
+            
             // String commands
             Command::Get(key) => self.get(&key).await,
             Command::Set(key, val) => self.set(key, val).await,
@@ -97,13 +101,6 @@ impl Db {
             Command::LTrim(key, s, e) => self.ltrim(key, s, e).await,
             Command::BRPop(key, timeout) => self.brpop(key, timeout).await,
 
-            // Sorted Set commands
-            Command::Expire(key, secs) => self.expire(key, secs).await,
-            Command::Ttl(key) => self.ttl(&key).await,
-            Command::ZAdd(key, score, member) => self.zadd(key, score, member).await,
-            Command::ZRangeByScore(key, min, max) => self.zrange_by_score(key, min, max).await,
-            Command::ZRem(key, member) => self.zrem(key, member).await,
-
             // Hash commands
             Command::HSet(key, field, value) => self.hset(key, field, value).await,
             Command::HGet(key, field) => self.hget(key, field).await,
@@ -124,6 +121,19 @@ impl Db {
             Command::SUnion(keys) => self.sunion(keys).await,
             Command::SInter(keys) => self.sinter(keys).await,
             Command::SDiff(keys) => self.sdiff(keys).await,
+            
+            // Sorted Set commands
+            Command::ZAdd(key, score, member) => self.zadd(key, score, member).await,
+            Command::ZRem(key, member) => self.zrem(key, member).await,
+            Command::ZRange(key, start, end) => self.zrange(key, start, end).await,
+            Command::ZRevRange(key, start, end) => self.zrevrange(key, start, end).await,
+            Command::ZCard(key) => self.zcard(key).await,
+            Command::ZScore(key, member) => self.zscore(key, member).await,
+            Command::ZRangeByScore(key, min, max) => self.zrange_by_score(key, min, max).await,
+            Command::ZRemRangeByScore(key, min, max) => self.zremrangebyscore(key, min, max).await,
+            Command::ZRank(key, member) => self.zrank(key, member).await,
+            Command::ZRevRank(key, member) => self.zrevrank(key, member).await,
+            Command::ZCount(key, min, max) => self.zcount(key, min, max).await,
         }
     }
 
@@ -629,7 +639,129 @@ impl Db {
             ),
         }
     }
+    
+    async fn zrem(&self, key: String, member: Vec<u8>) -> Frame {
+        self.check_and_purge(&key).await;
+        let mut inner = self.get_inner_mut().await;
+        let Some(value) = inner.get_mut(&key) else {
+            return Frame::Integer(0);
+        };
 
+        match value {
+            Value::ZSet(zset) => {
+                let removed = zset.remove_member(&member);
+                Frame::Integer(if removed { 1 } else { 0 })
+            }
+            _ => Frame::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            ),
+        }
+    }
+
+    async fn zrange(&self, key: String, start: i64, end: i64) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::ZSet(zset)) => {
+                let len = zset.len() as i64;
+                if len == 0 {
+                    return Frame::Array(vec![]);
+                }
+
+                let mut s = if start < 0 { len + start } else { start };
+                let mut e = if end < 0 { len + end } else { end };
+
+                if s < 0 { s = 0; }
+                if e < 0 { e = 0; }
+                if e >= len { e = len - 1; }
+
+                if s > e || s >= len {
+                    return Frame::Array(vec![]);
+                }
+
+                let vals = zset.range_by_rank(s, e);
+                Frame::Array(vals.into_iter().map(Frame::Bulk).collect())
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
+
+    async fn zrevrange(&self, key: String, start: i64, end: i64) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Array(vec![]);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::ZSet(zset)) => {
+                let len = zset.len() as i64;
+                if len == 0 {
+                    return Frame::Array(vec![]);
+                }
+
+                let mut s = if start < 0 { len + start } else { start };
+                let mut e = if end < 0 { len + end } else { end };
+
+                if s < 0 { s = 0; }
+                if e < 0 { e = 0; }
+                if e >= len { e = len - 1; }
+
+                if s > e || s >= len {
+                    return Frame::Array(vec![]);
+                }
+
+                let real_start = len - 1 - s;
+                let real_end   = len - 1 - e;
+
+                let vals = zset.range_by_rank(real_end, real_start);
+                let rev = vals.into_iter().rev().collect::<Vec<_>>();
+
+                Frame::Array(rev.into_iter().map(Frame::Bulk).collect())
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Array(vec![]),
+        }
+    }
+
+    async fn zcard(&self, key: String) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::ZSet(zset)) => Frame::Integer(zset.len() as i64),   
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn zscore(&self, key: String, member: Vec<u8>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Null;
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::ZSet(zset)) => {
+                match zset.get_score(&member) {
+                    Some(score) => Frame::Bulk(score.to_string().into_bytes()),
+                    None => Frame::Null,
+                }
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Null,
+        }
+    }
+ 
     async fn zrange_by_score(&self, key: String, min: f64, max: f64) -> Frame {
         self.check_and_purge(&key).await;
         let inner = self.get_inner().await;
@@ -652,21 +784,77 @@ impl Db {
         }
     }
 
-    async fn zrem(&self, key: String, member: Vec<u8>) -> Frame {
-        self.check_and_purge(&key).await;
-        let mut inner = self.get_inner_mut().await;
-        let Some(value) = inner.get_mut(&key) else {
+    async fn zremrangebyscore(&self, key: String, min: f64, max: f64) -> Frame {
+        if self.check_and_purge(&key).await {
             return Frame::Integer(0);
-        };
+        }
 
-        match value {
-            Value::ZSet(zset) => {
-                let removed = zset.remove_member(&member);
-                Frame::Integer(if removed { 1 } else { 0 })
+        let mut inner = self.inner.write().await;
+
+        match inner.get_mut(&key) {
+            Some(Value::ZSet(zset)) => {
+                let removed = zset.remove_range_by_score(min, max);
+                Frame::Integer(removed as i64)
             }
-            _ => Frame::Error(
-                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
-            ),
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Integer(0),
+        }
+    }
+
+    async fn zrank(&self, key: String, member: Vec<u8>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Null;
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::ZSet(zset)) => {
+                match zset.rank(&member) {
+                    Some(r) => Frame::Integer(r as i64),
+                    None => Frame::Null,
+                }
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Null,
+        }
+    }
+
+    async fn zrevrank(&self, key: String, member: Vec<u8>) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Null;
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::ZSet(zset)) => {
+                if let Some(r) = zset.rank(&member) {
+                    let rev = zset.len() - 1 - r;
+                    Frame::Integer(rev as i64)
+                } else {
+                    Frame::Null
+                }
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+            None => Frame::Null,
+        }
+    }
+
+    async fn zcount(&self, key: String, min: f64, max: f64) -> Frame {
+        if self.check_and_purge(&key).await {
+            return Frame::Integer(0);
+        }
+
+        let inner = self.inner.read().await;
+
+        match inner.get(&key) {
+            Some(Value::ZSet(zset)) => {
+                let items = zset.range_by_score(min, max);
+                Frame::Integer(items.len() as i64)
+            }
+            Some(_) => Frame::Error("WRONGTYPE Operation against a keyholding the wrong kind of value".into()),
+            None => Frame::Null,
         }
     }
 

@@ -65,6 +65,10 @@ impl SkipList {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
     pub fn insert(&mut self, score: f64, member: Vec<u8>) {
         self.remove_member(&member);
 
@@ -111,42 +115,7 @@ impl SkipList {
 
         self.length += 1;
     }
-
-    pub fn range_by_score(&self, min: f64, max: f64) -> Vec<Vec<u8>> {
-        let mut result = Vec::new();
-        let mut current = self.head.clone();
-
-        for lvl in (0..self.level).rev() {
-            loop {
-                let next_opt = current.lock().unwrap().levels[lvl].forward.clone();
-                match next_opt {
-                    Some(ref next) => {
-                        let nb = next.lock().unwrap();
-                        if nb.score < min {
-                            current = next.clone();
-                        } else {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
-
-        let mut current_opt = current.lock().unwrap().levels[0].forward.clone();
-
-        while let Some(node_rc) = current_opt {
-            let nb = node_rc.lock().unwrap();
-            if nb.score > max {
-                break;
-            }
-            result.push(nb.member.clone());
-            current_opt = nb.levels[0].forward.clone();
-        }
-
-        result
-    }
-
+    
     pub fn remove_member(&mut self, member: &[u8]) -> bool {
         let mut target: Option<NodeRef> = None;
         let mut current_opt = self.head.lock().unwrap().levels[0].forward.clone();
@@ -194,5 +163,116 @@ impl SkipList {
         }
 
         true
+    }
+
+    pub fn get_score(&self, member: &[u8]) -> Option<f64> {
+        let mut current_opt = self.head.lock().unwrap().levels[0].forward.clone();
+        while let Some(node_rc) = current_opt {
+            let node = node_rc.lock().unwrap();
+            if node.member == member {
+                return Some(node.score)
+            }
+            current_opt = node.levels[0].forward.clone();
+        }
+        None
+    }
+    
+    pub fn range_by_score(&self, min: f64, max: f64) -> Vec<Vec<u8>> {
+        let mut result = Vec::new();
+        let mut current = self.head.clone();
+
+        for lvl in (0..self.level).rev() {
+            loop {
+                let next_opt = current.lock().unwrap().levels[lvl].forward.clone();
+                match next_opt {
+                    Some(ref next) => {
+                        let nb = next.lock().unwrap();
+                        if nb.score < min {
+                            current = next.clone();
+                        } else {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        let mut current_opt = current.lock().unwrap().levels[0].forward.clone();
+
+        while let Some(node_rc) = current_opt {
+            let nb = node_rc.lock().unwrap();
+            if nb.score > max {
+                break;
+            }
+            result.push(nb.member.clone());
+            current_opt = nb.levels[0].forward.clone();
+        }
+
+        result
+    }
+
+    pub fn remove_range_by_score(&mut self, min: f64, max: f64) -> usize {
+        let mut removed = 0;
+
+        let mut to_remove = Vec::new();
+
+        let mut current_opt = self.head.lock().unwrap().levels[0].forward.clone();
+        while let Some(node_rc) = current_opt {
+            let node = node_rc.lock().unwrap();
+
+            if node.score >= min && node.score <= max {
+                to_remove.push(node.member.clone());
+            }
+            current_opt = node.levels[0].forward.clone();
+        }
+
+        for member in to_remove {
+            if self.remove_member(&member) {
+                removed += 1;
+            }
+        }
+
+        removed
+    }
+
+    pub fn rank(&self, member: &[u8]) -> Option<usize> {
+        let mut rank: usize = 0;
+        let mut current_opt = self.head.lock().unwrap().levels[0].forward.clone();
+
+        while let Some(node_rc) = current_opt {
+            let node = node_rc.lock().unwrap();
+            if node.member == member {
+                return Some(rank);
+            }
+            rank += 1;
+            current_opt = node.levels[0].forward.clone();
+        }
+
+        None
+    }
+
+    pub fn range_by_rank(&self, start: i64, end: i64) -> Vec<Vec<u8>> {
+        let mut result = Vec::new();
+
+        let mut idx: i64 = 0;
+        let mut current_opt = self.head.lock().unwrap().levels[0].forward.clone();
+
+        while let Some(node_rc) = current_opt {
+            let node = node_rc.lock().unwrap();
+
+            if idx > end {
+                break;
+            }
+
+            if idx >= start {
+                result.push(node.member.clone());
+            }
+
+            idx += 1;
+            current_opt = node.levels[0].forward.clone();
+        }
+
+        result
     }
 }

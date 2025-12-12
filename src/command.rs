@@ -4,6 +4,10 @@ use crate::resp::Frame;
 #[derive(Debug)]
 pub enum Command {
     Ping,
+    
+    // Keyspace commands
+    Expire(String, usize),
+    Ttl(String),
 
     // String commands
     Get(String),
@@ -29,13 +33,6 @@ pub enum Command {
     LTrim(String, i64, i64),
     BRPop(String, usize),
 
-    // Sorted Set Commands
-    Expire(String, usize),
-    Ttl(String),
-    ZAdd(String, f64, Vec<u8>),
-    ZRangeByScore(String, f64, f64),
-    ZRem(String, Vec<u8>),
-
     // Hash commands
     HSet(String, String, Vec<u8>),
     HGet(String, String),
@@ -56,6 +53,19 @@ pub enum Command {
     SUnion(Vec<String>),
     SInter(Vec<String>),
     SDiff(Vec<String>),
+    
+    // Sorted Set Commands
+    ZAdd(String, f64, Vec<u8>),
+    ZRem(String, Vec<u8>),
+    ZRange(String, i64, i64),
+    ZRevRange(String, i64, i64),
+    ZCard(String),
+    ZScore(String, Vec<u8>),
+    ZRangeByScore(String, f64, f64),
+    ZRemRangeByScore(String, f64, f64),
+    ZRank(String, Vec<u8>),
+    ZRevRank(String, Vec<u8>),
+    ZCount(String, f64, f64),
 }
 
 impl TryFrom<Frame> for Command {
@@ -79,6 +89,25 @@ impl TryFrom<Frame> for Command {
 
         match cmd_name.as_str() {
             "PING" => Ok(Command::Ping),
+            
+            // Keyspace commands
+            "EXPIRE" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'EXPIRE'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let secs: usize = frame_to_string(&arr[2])?
+                    .parse::<usize>()
+                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
+                Ok(Command::Expire(key, secs))
+            }
+            "TTL" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'TTL'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                Ok(Command::Ttl(key))
+            }
 
             // String commands
             "GET" => {
@@ -261,59 +290,6 @@ impl TryFrom<Frame> for Command {
                 Ok(Command::BRPop(key, timeout))
             }
 
-            // Sorted Set commands
-            "EXPIRE" => {
-                if arr.len() != 3 {
-                    return Err(RedisError::Other("ERR wrong number of arguments for 'EXPIRE'".into()));
-                }
-                let key = frame_to_string(&arr[1])?;
-                let secs: usize = frame_to_string(&arr[2])?
-                    .parse::<usize>()
-                    .map_err(|_| RedisError::Other("ERR value is not an integer".into()))?;
-                Ok(Command::Expire(key, secs))
-            }
-            "TTL" => {
-                if arr.len() != 2 {
-                    return Err(RedisError::Other("ERR wrong number of arguments for 'TTL'".into()));
-                }
-                let key = frame_to_string(&arr[1])?;
-                Ok(Command::Ttl(key))
-            }
-            "ZADD" => {
-                if arr.len() != 4 {
-                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZADD'".into()));
-                }
-                let key = frame_to_string(&arr[1])?;
-                let score: f64 = frame_to_string(&arr[2])?
-                    .parse()
-                    .map_err(|_| RedisError::Other("ERR score must be a float".into()))?;
-                let member = frame_to_bytes(&arr[3])?;
-                Ok(Command::ZAdd(key, score, member))
-            }
-            "ZRANGEBYSCORE" => {
-                if arr.len() != 4 {
-                    return Err(RedisError::Other(
-                        "ERR wrong number of arguments for 'ZRANGEBYSCORE'".into(),
-                    ));
-                }
-                let key = frame_to_string(&arr[1])?;
-                let min: f64 = frame_to_string(&arr[2])?
-                    .parse()
-                    .map_err(|_| RedisError::Other("ERR min must be a float".into()))?;
-                let max: f64 = frame_to_string(&arr[3])?
-                    .parse()
-                    .map_err(|_| RedisError::Other("ERR max must be a float".into()))?;
-                Ok(Command::ZRangeByScore(key, min, max))
-            }
-            "ZREM" => {
-                if arr.len() != 3 {
-                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZREM'".into()));
-                }
-                let key = frame_to_string(&arr[1])?;
-                let member = frame_to_bytes(&arr[2])?;
-                Ok(Command::ZRem(key, member))
-            }
-
             // Hash commands
             "HSET" => {
                 if arr.len() != 4 {
@@ -458,6 +434,132 @@ impl TryFrom<Frame> for Command {
                     .map(|f| frame_to_string(f))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Command::SDiff(keys))
+            }
+            
+            // Sorted Set commands
+            "ZADD" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZADD'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let score: f64 = frame_to_string(&arr[2])?
+                    .parse()
+                    .map_err(|_| RedisError::Other("ERR score must be a float".into()))?;
+                let member = frame_to_bytes(&arr[3])?;
+                Ok(Command::ZAdd(key, score, member))
+            }
+            "ZREM" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZREM'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let member = frame_to_bytes(&arr[2])?;
+                Ok(Command::ZRem(key, member))
+            }
+            "ZRANGE" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other(
+                        "ERR wrong number of arguments for 'ZRANGE'".into(),
+                    ));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let start = frame_to_string(&arr[2])?
+                    .parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR start must be an integer".into()))?;
+                let end = frame_to_string(&arr[3])?
+                    .parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR stop must be an integer".into()))?;
+                Ok(Command::ZRange(key, start, end))
+            }
+            "ZREVRANGE" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other(
+                        "ERR wrong number of arguments for 'ZREVRANGE'".into(),
+                    ));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let start = frame_to_string(&arr[2])?
+                    .parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR start must be an integer".into()))?;
+                let end = frame_to_string(&arr[3])?
+                    .parse::<i64>()
+                    .map_err(|_| RedisError::Other("ERR start must be an integer".into()))?;
+                Ok(Command::ZRevRange(key, start, end))
+            }
+            "ZCARD" => {
+                if arr.len() != 2 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZCARD'".into()));
+                }
+                Ok(Command::ZCard(frame_to_string(&arr[1])?))
+            }
+            "ZSCORE" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other(
+                            "ERR wrong number of arguments for 'ZSCORE'".into()
+                    ));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let member = frame_to_bytes(&arr[2])?;
+                Ok(Command::ZScore(key, member))
+            }
+            "ZRANGEBYSCORE" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other(
+                        "ERR wrong number of arguments for 'ZRANGEBYSCORE'".into(),
+                    ));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let min: f64 = frame_to_string(&arr[2])?
+                    .parse()
+                    .map_err(|_| RedisError::Other("ERR min must be a float".into()))?;
+                let max: f64 = frame_to_string(&arr[3])?
+                    .parse()
+                    .map_err(|_| RedisError::Other("ERR max must be a float".into()))?;
+                Ok(Command::ZRangeByScore(key, min, max))
+            }
+            "ZREMRANGEBYSCORE" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other(
+                        "ERR wrong number of arguments for 'ZREMRANGEBYSCORE'".into(),
+                    ));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let min: f64 = frame_to_string(&arr[2])?
+                    .parse()
+                    .map_err(|_| RedisError::Other("ERR min must be a float".into()))?;
+                let max: f64 = frame_to_string(&arr[3])?
+                    .parse()
+                    .map_err(|_| RedisError::Other("ERR max must be a float".into()))?;
+                Ok(Command::ZRemRangeByScore(key, min, max))
+            }
+            "ZRANK" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZRANK'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let member = frame_to_bytes(&arr[2])?;
+                Ok(Command::ZRank(key, member))
+            }
+            "ZREVRANK" => {
+                if arr.len() != 3 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZREVRANK'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let member = frame_to_bytes(&arr[2])?;
+                Ok(Command::ZRevRank(key, member))
+            }
+            "ZCOUNT" => {
+                if arr.len() != 4 {
+                    return Err(RedisError::Other("ERR wrong number of arguments for 'ZCOUNT'".into()));
+                }
+                let key = frame_to_string(&arr[1])?;
+                let min = frame_to_string(&arr[2])?
+                    .parse::<f64>()
+                    .map_err(|_| RedisError::Other("ERR start must be a float".into()))?;
+                let max = frame_to_string(&arr[3])?
+                    .parse::<f64>()
+                    .map_err(|_| RedisError::Other("ERR start must be a float".into()))?;
+                Ok(Command::ZCount(key, min, max))
             }
             _ => Err(RedisError::UnknownCommand),
         }
