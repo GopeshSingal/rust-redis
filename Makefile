@@ -11,6 +11,9 @@ dev-shell:
 		$(IMAGE_NAME) \
 		bash
 
+dev-enter:
+	docker exec -it $$(docker ps -f "ancestor=$(IMAGE_NAME)" -q) bash
+
 dev-run:
 	docker run -it --rm \
 		-p 6379:6379 \
