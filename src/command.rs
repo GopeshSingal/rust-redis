@@ -1,7 +1,9 @@
 use crate::errors::RedisError;
 use crate::resp::Frame;
 
-#[derive(Debug)]
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     Ping,
     
@@ -596,6 +598,43 @@ impl TryFrom<Frame> for Command {
                 Ok(Command::ZCount(key, min, max))
             }
             _ => Err(RedisError::UnknownCommand),
+        }
+    }
+}
+
+impl Command {
+    
+    pub fn is_write_for_aof(&self) -> bool {
+        use Command::*;
+        match self {
+            Expire(_, _) => true,
+
+            Set(_, _)
+            | Del(_)
+            | Append(_, _)
+            | GetSet(_, _)
+            | Incr(_)
+            | IncrBy(_, _)
+            | MSet(_) => true,
+
+            LPush(_, _)
+            | LPop(_)
+            | RPush(_, _)
+            | RPop(_)
+            | LSet(_, _, _)
+            | LTrim(_, _, _) => true,
+
+            BRPop(_, _) => false,
+
+            HSet(_, _, _) | HDel(_, _) => true,
+
+            SAdd(_, _) | SRem(_, _) => true,
+
+            ZAdd(_, _, _)
+            | ZRem(_, _)
+            | ZRemRangeByScore(_, _, _) => true,
+
+            _ => false,
         }
     }
 }
