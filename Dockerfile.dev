@@ -9,8 +9,33 @@ RUN apt-get update && \
 		git \
 		curl \
 		netcat-traditional \
-		neovim \
 		tmux \
+        ca-certificates \
+        ripgrep \
+        fd-find \
 	&& rm -rf /var/lib/apt/lists/*
 
+RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+# ----- Install latest stable Neovim ----- #
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) nvim_arch="x86_64" ;; \
+      arm64) nvim_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/neovim/neovim/releases/latest/download/nvim-linux-${nvim_arch}.tar.gz"; \
+    curl -fL --retry 5 --retry-delay 2 -o /tmp/nvim.tar.gz "$url"; \
+    tar -C /opt -xzf /tmp/nvim.tar.gz; \
+    "/opt/nvim-linux-${nvim_arch}/bin/nvim" --version; \
+    ln -sf "/opt/nvim-linux-${nvim_arch}/bin/nvim" /usr/local/bin/nvim; \
+    rm /tmp/nvim.tar.gz
+
 WORKDIR /workspace
+
+# ----- Rust editor tooling ----- #
+RUN rustup component add rust-analyzer rust-src rustfmt clippy
+RUN cargo install cargo-watch cargo-edit || true
+
+COPY nvim/ /root/.config/nvim
